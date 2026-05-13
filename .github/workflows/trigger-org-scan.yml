@@ -1,0 +1,61 @@
+name: Trigger Org-Wide Malware Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_archived:
+        description: "Scan archived repos too?"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+jobs:
+  list-repos:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+    steps:
+      - name: List all org repos
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+        run: |
+          ACTIVE=$(gh repo list hngprojects --limit 500 --json name --jq '.[].name')
+          if [[ "${{ inputs.include_archived }}" == "true" ]]; then
+            ARCHIVED=$(gh repo list hngprojects --limit 500 --archived --json name --jq '.[].name')
+            ALL=$(echo -e "$ACTIVE\n$ARCHIVED" | sort -u | grep -v '^$')
+          else
+            ALL="$ACTIVE"
+          fi
+          # Output as JSON array for matrix
+          JSON=$(echo "$ALL" | jq -R -s 'split("\n") | map(select(length > 0))')
+          echo "repos=$JSON" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: list-repos
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        repo: ${{ fromJson(needs.list-repos.outputs.repos) }}
+    steps:
+      - name: Trigger scan for ${{ matrix.repo }}
+        env:
+          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+        run: |
+          gh workflow run malware-scan-fix.yml \
+            --repo hngprojects/.github \
+            --field repo=${{ matrix.repo }}
+
+  summary:
+    needs: scan
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Post summary link
+        run: |
+          echo "### Org-wide scan dispatched" >> "$GITHUB_STEP_SUMMARY"
+          echo "All per-repo scan runs are available at:" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/hngprojects/.github/actions/workflows/malware-scan-fix.yml" >> "$GITHUB_STEP_SUMMARY"
