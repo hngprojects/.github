@@ -15,47 +15,61 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.list.outputs.repos }}
+      count: ${{ steps.list.outputs.count }}
     steps:
       - name: List all org repos
         id: list
         env:
           GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          INCLUDE_ARCHIVED: ${{ inputs.include_archived }}
         run: |
-          ACTIVE=$(gh repo list hngprojects --limit 500 --json name --jq '.[].name')
-          if [[ "${{ inputs.include_archived }}" == "true" ]]; then
-            ARCHIVED=$(gh repo list hngprojects --limit 500 --archived --json name --jq '.[].name')
-            ALL=$(echo -e "$ACTIVE\n$ARCHIVED" | sort -u | grep -v '^$')
+          set -euo pipefail
+          if [[ "$INCLUDE_ARCHIVED" == "true" ]]; then
+            ALL=$(gh repo list hngprojects --limit 500 --json name --jq '.[].name')
           else
-            ALL="$ACTIVE"
+            ALL=$(gh repo list hngprojects --limit 500 --no-archived --json name --jq '.[].name')
           fi
-          # Output as JSON array for matrix
-          JSON=$(echo "$ALL" | jq -R -s 'split("\n") | map(select(length > 0))')
+          JSON=$(printf '%s\n' "$ALL" | jq -R -c -s 'split("\n") | map(select(length > 0))')
+          COUNT=$(echo "$JSON" | jq 'length')
+          echo "Found $COUNT repos"
           echo "repos=$JSON" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
   scan:
     needs: list-repos
+    if: needs.list-repos.outputs.count != '0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 10
       matrix:
         repo: ${{ fromJson(needs.list-repos.outputs.repos) }}
+    permissions:
+      contents: read
     steps:
-      - name: Trigger scan for ${{ matrix.repo }}
+      - name: Dispatch malware-scan-fix for ${{ matrix.repo }}
         env:
           GH_TOKEN: ${{ secrets.ORG_TOKEN }}
+          TARGET_REPO: ${{ matrix.repo }}
         run: |
+          set -euo pipefail
           gh workflow run malware-scan-fix.yml \
             --repo hngprojects/.github \
-            --field repo=${{ matrix.repo }}
+            --ref main \
+            --field repo="$TARGET_REPO"
+          echo "Dispatched scan for $TARGET_REPO"
 
   summary:
-    needs: scan
+    needs: [list-repos, scan]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Post summary link
         run: |
-          echo "### Org-wide scan dispatched" >> "$GITHUB_STEP_SUMMARY"
-          echo "All per-repo scan runs are available at:" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://github.com/hngprojects/.github/actions/workflows/malware-scan-fix.yml" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Org-wide scan dispatched"
+            echo ""
+            echo "Repos targeted: **${{ needs.list-repos.outputs.count }}**"
+            echo ""
+            echo "Per-repo runs: https://github.com/hngprojects/.github/actions/workflows/malware-scan-fix.yml"
+          } >> "$GITHUB_STEP_SUMMARY"
