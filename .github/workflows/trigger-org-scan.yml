@@ -38,38 +38,117 @@ jobs:
   scan:
     needs: list-repos
     if: needs.list-repos.outputs.count != '0'
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 15
       matrix:
         repo: ${{ fromJson(needs.list-repos.outputs.repos) }}
-    permissions:
-      contents: read
-    steps:
-      - name: Dispatch malware-scan-fix for ${{ matrix.repo }}
-        env:
-          GH_TOKEN: ${{ secrets.ORG_TOKEN }}
-          TARGET_REPO: ${{ matrix.repo }}
-        run: |
-          set -euo pipefail
-          gh workflow run malware-scan-fix.yml \
-            --repo hngprojects/.github \
-            --ref main \
-            --field repo="$TARGET_REPO"
-          echo "Dispatched scan for $TARGET_REPO"
+    uses: ./.github/workflows/malware-scan-fix.yml
+    with:
+      repo: ${{ matrix.repo }}
+    secrets:
+      ORG_TOKEN: ${{ secrets.ORG_TOKEN }}
 
-  summary:
-    needs: [list-repos, scan]
-    runs-on: ubuntu-latest
+  aggregate:
+    needs: scan
     if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: Post summary link
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: results
+          pattern: scan-*
+          merge-multiple: false
+
+      - name: Aggregate results
+        shell: bash
         run: |
+          set -uo pipefail
+          mkdir -p /tmp/agg
+          INFECTED=()
+          CLEAN=()
+          SKIPPED=()
+          PUSH_BLOCKED=()
+
+          for dir in results/scan-*; do
+            [[ -d "$dir" ]] || continue
+            if [[ -f "$dir/result.json" ]]; then
+              REPO=$(jq -r '.repo' "$dir/result.json")
+              STATUS=$(jq -r '.status' "$dir/result.json")
+              PUSH=$(jq -r '.push' "$dir/result.json")
+              HC=$(jq -r '.head_count' "$dir/result.json")
+              BC=$(jq -r '.branch_count' "$dir/result.json")
+              HIC=$(jq -r '.history_count' "$dir/result.json")
+              case "$STATUS" in
+                infected)
+                  INFECTED+=("$REPO|$HC|$BC|$HIC|$PUSH")
+                  [[ "$PUSH" == "blocked" ]] && PUSH_BLOCKED+=("$REPO")
+                  ;;
+                clean)    CLEAN+=("$REPO") ;;
+                skipped)  SKIPPED+=("$REPO") ;;
+              esac
+            fi
+          done
+
           {
-            echo "### Org-wide scan dispatched"
+            echo "# Org-Wide Malware Scan — Aggregated Report"
             echo ""
-            echo "Repos targeted: **${{ needs.list-repos.outputs.count }}**"
+            echo "**Totals:** ${#INFECTED[@]} infected · ${#CLEAN[@]} clean · ${#SKIPPED[@]} skipped"
             echo ""
-            echo "Per-repo runs: https://github.com/hngprojects/.github/actions/workflows/malware-scan-fix.yml"
+
+            if [[ ${#INFECTED[@]} -gt 0 ]]; then
+              echo "## Infected repos (${#INFECTED[@]})"
+              echo ""
+              echo "| Repo | HEAD files | Branch hits | History commits | Push result |"
+              echo "|------|-----------:|------------:|----------------:|-------------|"
+              for entry in "${INFECTED[@]}"; do
+                IFS='|' read -r repo hc bc hic push <<< "$entry"
+                echo "| [\`$repo\`](https://github.com/hngprojects/$repo) | $hc | $bc | $hic | $push |"
+              done
+              echo ""
+            fi
+
+            if [[ ${#PUSH_BLOCKED[@]} -gt 0 ]]; then
+              echo "## Push blocked (branch protection — needs manual fix)"
+              echo ""
+              for r in "${PUSH_BLOCKED[@]}"; do
+                echo "- \`$r\`"
+              done
+              echo ""
+            fi
+
+            if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+              echo "## Skipped (empty or inaccessible)"
+              echo ""
+              for r in "${SKIPPED[@]}"; do
+                echo "- \`$r\`"
+              done
+              echo ""
+            fi
+
+            echo "## Clean repos (${#CLEAN[@]})"
+            echo ""
+            echo "<details><summary>Show list</summary>"
+            echo ""
+            for r in "${CLEAN[@]}"; do
+              echo "- \`$r\`"
+            done
+            echo ""
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Also write JSON summary for downstream consumption
+          jq -n \
+            --argjson infected "$(printf '%s\n' "${INFECTED[@]}" | jq -R -s -c 'split("\n") | map(select(length>0))')" \
+            --argjson clean "$(printf '%s\n' "${CLEAN[@]}" | jq -R -s -c 'split("\n") | map(select(length>0))')" \
+            --argjson skipped "$(printf '%s\n' "${SKIPPED[@]}" | jq -R -s -c 'split("\n") | map(select(length>0))')" \
+            '{infected:$infected, clean:$clean, skipped:$skipped}' \
+            > /tmp/agg/summary.json
+
+      - name: Upload aggregated summary
+        uses: actions/upload-artifact@v5
+        with:
+          name: org-scan-summary
+          path: /tmp/agg/summary.json
+          retention-days: 7
